@@ -229,6 +229,21 @@ pub fn name_mentions(text: &str, mentions: &[Mention]) -> String {
     plain(text, mentions)
 }
 
+// Characters the scans have read. The tests count them, to keep the work
+// per character of a message fixed (#1177).
+#[cfg(test)]
+thread_local! {
+    static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts what a scan read.
+#[inline]
+fn tally(read: usize) {
+    #[cfg(test)]
+    READS.with(|reads| reads.set(reads.get() + read as u64));
+    let _ = read;
+}
+
 fn parse(text: &str, mentions: &[Mention]) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut in_block = false;
@@ -402,6 +417,7 @@ fn link_and_mention(span: Span, mentions: &[Mention]) -> Vec<Span> {
     let mut plain_start = 0;
     let mut i = 0;
     let bytes = text.as_bytes();
+    let mut scan = LinkScan::default();
     while i < text.len() {
         if !text.is_char_boundary(i) {
             i += 1;
@@ -413,9 +429,8 @@ fn link_and_mention(span: Span, mentions: &[Mention]) -> Vec<Span> {
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric());
         if at_boundary {
-            if (bytes[i].is_ascii_digit() || matches!(bytes[i], b'+' | b'('))
-                && let Some((end, digits, valid)) = phone_at(text, i)
-            {
+            if bytes[i].is_ascii_digit() || matches!(bytes[i], b'+' | b'(') {
+                let (end, digits, valid) = phone_at(text, i);
                 if valid {
                     push_plain(&mut out, &span, &text[plain_start..i]);
                     out.push(Span {
@@ -431,14 +446,28 @@ fn link_and_mention(span: Span, mentions: &[Mention]) -> Vec<Span> {
                     i = end;
                     continue;
                 }
-                if digits.is_empty() && end > i {
-                    i = end;
+                // A date is stepped over, as before, and so is a run of
+                // brackets and dashes with no number in it: reading it again
+                // from each bracket would cost the rest of the line.
+                if digits.is_empty() {
+                    i = end.max(i + 1);
                     continue;
                 }
                 // Don't retry a suffix of an oversized number as a new link.
                 // Let the email parser inspect the whole token when it ends in @.
                 if digits.len() > 15 && !text[end..].starts_with('@') {
                     i = end;
+                    continue;
+                }
+                // The brackets and spaces before its digits would each read
+                // the same number again, and none of them starts a link.
+                if bytes[i] == b'('
+                    && end > i
+                    && let Some(digits_at) = text[i + 1..end]
+                        .bytes()
+                        .position(|byte| byte.is_ascii_digit())
+                {
+                    i += 1 + digits_at;
                     continue;
                 }
             }
@@ -458,7 +487,7 @@ fn link_and_mention(span: Span, mentions: &[Mention]) -> Vec<Span> {
             }
             // Links start with a letter or digit. Skip punctuation runs.
             if bytes[i].is_ascii_alphanumeric()
-                && let Some((end, url)) = link_at(text, i)
+                && let Some((end, url)) = scan.link_at(text, i)
             {
                 push_plain(&mut out, &span, &text[plain_start..i]);
                 out.push(Span {
@@ -481,27 +510,30 @@ fn link_and_mention(span: Span, mentions: &[Mention]) -> Vec<Span> {
     out
 }
 
+/// Where an ISO date that starts at `at` ends, as `2026-10-01` or
+/// `(2026-10-01)`: the token after it may be a time or a separate phone
+/// number.
+fn date_end(text: &str, at: usize) -> Option<usize> {
+    let date_at = at + usize::from(text[at..].starts_with('('));
+    let date = text.as_bytes().get(date_at..date_at + 10)?;
+    (date[4] == b'-'
+        && date[7] == b'-'
+        && date[..4].iter().all(u8::is_ascii_digit)
+        && date[5..7].iter().all(u8::is_ascii_digit)
+        && date[8..].iter().all(u8::is_ascii_digit))
+    .then_some(date_at + 10)
+}
+
 /// Finds a phone candidate with optional spaces, hyphens, and parentheses.
 /// Dots are excluded so formatted tax IDs such as XXX.XXX.XXX-XX stay plain.
 /// The validity flag lets the caller skip an oversized number as one token.
-fn phone_at(text: &str, at: usize) -> Option<(usize, String, bool)> {
-    // Reject an ISO date before scanning through the space after it; the next
-    // token may be a time or a separate phone number.
-    let date_at = at + usize::from(text[at..].starts_with('('));
-    let iso_date = text
-        .as_bytes()
-        .get(date_at..date_at + 10)
-        .is_some_and(|date| {
-            date[4] == b'-'
-                && date[7] == b'-'
-                && date[..4].iter().all(u8::is_ascii_digit)
-                && date[5..7].iter().all(u8::is_ascii_digit)
-                && date[8..].iter().all(u8::is_ascii_digit)
-        });
-    if iso_date {
-        return Some((date_at + 10, String::new(), false));
+/// Without digits the end is where the run of brackets, dashes and spaces
+/// from `at` ends, so the caller can step over it instead of reading it
+/// again from each bracket in it.
+fn phone_at(text: &str, at: usize) -> (usize, String, bool) {
+    if let Some(end) = date_end(text, at) {
+        return (end, String::new(), false);
     }
-
     let mut end = at;
     let mut digits = String::new();
     for (offset, c) in text[at..].char_indices() {
@@ -516,22 +548,24 @@ fn phone_at(text: &str, at: usize) -> Option<(usize, String, bool)> {
         }
         end = at + offset + c.len_utf8();
     }
+    let run_end = end;
+    tally(end - at);
     while end > at && text[..end].ends_with([' ', '-', '(']) {
-        end -= text[..end].chars().next_back()?.len_utf8();
+        end -= text[..end].chars().next_back().map_or(0, char::len_utf8);
     }
     let following = text[end..].chars().next();
     let valid = digits.len() >= 7
         && digits.len() <= 15
         && following.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '@');
-    (!digits.is_empty()).then_some((
-        end,
+    (
+        if digits.is_empty() { run_end } else { end },
         if text[at..].starts_with('+') {
             format!("+{digits}")
         } else {
             digits
         },
         valid,
-    ))
+    )
 }
 
 fn push_plain(out: &mut Vec<Span>, template: &Span, text: &str) {
@@ -562,61 +596,255 @@ fn mention_at<'m>(text: &str, at: usize, mentions: &'m [Mention]) -> Option<(usi
     Some((at + 1 + digits.len(), mention))
 }
 
-/// Parses a web or email address at `at` and returns its end and target.
-fn link_at(text: &str, at: usize) -> Option<(usize, String)> {
-    let rest = &text[at..];
-    // Brackets opened inside the address belong to it, as in
-    // `https://en.wikipedia.org/wiki/Rust_(programming_language)`; a closing
-    // one without its opener closes the text around it: `(see example.com)`.
-    let (mut parens, mut squares) = (0usize, 0usize);
-    let token_end = rest
-        .find(|c: char| {
+/// What [`link_and_mention`] has read of the text so far. Its candidates
+/// come in order, and what one has read holds for those after it, so a long
+/// token is read once rather than again from each of its letters (#1177).
+#[derive(Default)]
+struct LinkScan {
+    tokens: Tokens,
+    /// The last search for `@`, and for `/`: where it started and what it
+    /// found from there on.
+    at_sign: Option<(usize, Option<usize>)>,
+    slash: Option<(usize, Option<usize>)>,
+    /// Whether the address after a `@` is a host, asked once for the `@`,
+    /// the token's end and the answer.
+    host: Option<(usize, usize, bool)>,
+    /// Nothing that starts before this position is a host.
+    not_a_host_before: usize,
+}
+
+impl LinkScan {
+    /// A mail address or a site at `at`, a letter or digit, as a scan from
+    /// `at` alone would read it.
+    fn link_at(&mut self, text: &str, at: usize) -> Option<(usize, String)> {
+        let end = self.tokens.stripped_end(text, at);
+        let token = &text[at..end];
+        if token.len() < 4 {
+            return None;
+        }
+        let starts = |scheme: &str| {
+            token
+                .get(..scheme.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+        };
+        if starts("http://") || starts("https://") {
+            return (token.len() > 8).then(|| (end, token.to_owned()));
+        }
+        if starts("www.") {
+            return Some((end, format!("https://{token}")));
+        }
+        if starts("mailto:") {
+            return Some((end, token.to_owned()));
+        }
+        // A mail address: its user is what stands before the first `@` of
+        // the token, and cannot contain a `/`.
+        let at_sign = next_byte(text, at, b'@', &mut self.at_sign).filter(|at_sign| *at_sign < end);
+        let slash = next_byte(text, at, b'/', &mut self.slash);
+        if let Some(at_sign) = at_sign
+            && slash.is_none_or(|slash| slash > at_sign)
+            && self.host_is(text, at_sign + 1, end)
+        {
+            return Some((end, format!("mailto:{token}")));
+        }
+        // A host without its scheme, up to a `/`.
+        if at >= self.not_a_host_before {
+            let host_end = slash.filter(|slash| *slash < end).unwrap_or(end);
+            match host_from(text, at, host_end) {
+                Ok(()) => return Some((end, format!("https://{token}"))),
+                Err(until) => self.not_a_host_before = self.not_a_host_before.max(until),
+            }
+        }
+        None
+    }
+
+    /// Whether `text[from..end]` is a host, asked once for each `@`: every
+    /// candidate before the same `@` has the same address after it.
+    fn host_is(&mut self, text: &str, from: usize, end: usize) -> bool {
+        match self.host {
+            Some((asked_from, asked_end, is_host)) if asked_from == from && asked_end == end => {
+                is_host
+            }
+            _ => {
+                let is_host = host_from(text, from, end).is_ok();
+                self.host = Some((from, end, is_host));
+                is_host
+            }
+        }
+    }
+}
+
+/// The next `byte` at or after `at`. `last` is where the search before this
+/// one started and what it found, which still holds from there on.
+fn next_byte(
+    text: &str,
+    at: usize,
+    byte: u8,
+    last: &mut Option<(usize, Option<usize>)>,
+) -> Option<usize> {
+    if last.is_none_or(|(from, found)| at < from || found.is_some_and(|found| found < at)) {
+        let found = text.as_bytes()[at..]
+            .iter()
+            .position(|found| *found == byte)
+            .map(|found| found + at);
+        tally(found.unwrap_or(text.len()) - at);
+        *last = Some((at, found));
+    }
+    last.as_ref().and_then(|(_, found)| *found)
+}
+
+/// Whether `text[start..end]` is a host, as [`is_domain`] says of it. When
+/// it is not, the error is a position up to which nothing that starts
+/// earlier is a host either: everything the scan found wrong comes before
+/// it, and is wrong for a host that starts earlier too, so the candidates in
+/// between need not be read (#1177). That holds when `start` is a letter or
+/// a digit.
+fn host_from(text: &str, start: usize, end: usize) -> Result<(), usize> {
+    let bytes = text.as_bytes();
+    if start == end {
+        return Err(start + 1);
+    }
+    // The name ends at a port, where `is_domain` cuts the host.
+    let name = start + text[start..end].find(':').unwrap_or(end - start);
+    let mut at = start;
+    while at < name {
+        match bytes[at] {
+            // The label that ends here may not end with `-`, and the next
+            // one may not be empty or start with one.
+            b'.' => {
+                if at + 1 < name && matches!(bytes[at + 1], b'.' | b'-') {
+                    return Err(at + 2);
+                }
+                if at > start && bytes[at - 1] == b'-' {
+                    return Err(at + 1);
+                }
+            }
+            b'-' if at == start => return Err(start + 1),
+            byte if byte.is_ascii_alphanumeric() || byte == b'-' => {}
+            _ => return Err(at + 1),
+        }
+        at += 1;
+    }
+    tally(name - start);
+    // `is_domain` cuts a host at its port: the name alone is the same
+    // question, without reading what follows the port.
+    if is_domain(&text[start..name]) {
+        Ok(())
+    } else if bytes[start].is_ascii_alphanumeric() {
+        Err(name)
+    } else {
+        Err(start + 1)
+    }
+}
+
+/// The token of the last candidate: from where to where it was read, and
+/// where the token starting at each byte of it ends, which differs inside
+/// its brackets.
+#[derive(Default)]
+struct Tokens {
+    from: usize,
+    end: usize,
+    read: bool,
+    /// `None` while no bracket closes inside the range: then every token in
+    /// it ends where the range does.
+    ends: Option<Vec<u32>>,
+    /// Each end a token in the range can have, in order, and the same
+    /// without the punctuation that closes a sentence.
+    stripped: Vec<(usize, usize)>,
+    closers: Vec<usize>,
+}
+
+impl Tokens {
+    /// Where the token starting at `at` ends, without its closing punctuation.
+    fn stripped_end(&mut self, text: &str, at: usize) -> usize {
+        if !self.read || at < self.from || at >= self.end {
+            self.read_token(text, at);
+        }
+        let end = match &self.ends {
+            Some(ends) => ends[at - self.from] as usize,
+            None => self.end,
+        };
+        let found = self
+            .stripped
+            .binary_search_by_key(&end, |&(raw, _)| raw)
+            .expect("each end of the range is listed");
+        self.stripped[found].1
+    }
+
+    /// Reads the token from `at` to its end, as a scan from `at` alone
+    /// would, and notes where the tokens starting inside it end.
+    fn read_token(&mut self, text: &str, at: usize) {
+        // Brackets opened inside the address belong to it, as in
+        // `https://en.wikipedia.org/wiki/Rust_(programming_language)`; a closing
+        // one without its opener closes the text around it: `(see example.com)`.
+        let (mut parens, mut squares) = (0usize, 0usize);
+        self.closers.clear();
+        let mut end = text.len();
+        for (offset, c) in text[at..].char_indices() {
             let depth = match c {
                 '(' | ')' => &mut parens,
                 '[' | ']' => &mut squares,
-                _ => return c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '{' | '}'),
+                _ => {
+                    if c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '{' | '}') {
+                        end = at + offset;
+                        break;
+                    }
+                    continue;
+                }
             };
             if matches!(c, '(' | '[') {
                 *depth += 1;
-                false
             } else if *depth > 0 {
                 *depth -= 1;
-                false
+                self.closers.push(at + offset);
             } else {
-                true
+                end = at + offset;
+                break;
             }
-        })
-        .unwrap_or(rest.len());
-    let mut token = &rest[..token_end];
-    while let Some(stripped) = token.strip_suffix(['.', ',', ';', ':', '!', '?', '*', '_', '~']) {
-        token = stripped;
+        }
+        tally(end - at);
+        self.from = at;
+        self.end = end;
+        self.read = true;
+        if self.closers.is_empty() {
+            self.ends = None;
+        } else {
+            // A token starting inside a pair of brackets ends at the bracket
+            // that closes it, each kind of bracket counted as the scan above
+            // counts it.
+            let ends = self.ends.get_or_insert_with(Vec::new);
+            ends.clear();
+            ends.resize(end - at, end as u32);
+            for (open, close) in [(b'(', b')'), (b'[', b']')] {
+                let (mut enclosing, mut outer) = (end, Vec::new());
+                for position in (at..end).rev() {
+                    match text.as_bytes()[position] {
+                        byte if byte == close => {
+                            outer.push(enclosing);
+                            enclosing = position;
+                        }
+                        byte if byte == open => enclosing = outer.pop().unwrap_or(enclosing),
+                        _ => {}
+                    }
+                    ends[position - at] = ends[position - at].min(enclosing as u32);
+                }
+                tally(end - at);
+            }
+        }
+        self.stripped.clear();
+        for raw in self.closers.iter().copied().chain([end]) {
+            let mut stripped = raw;
+            while stripped > at
+                && matches!(
+                    text.as_bytes()[stripped - 1],
+                    b'.' | b',' | b';' | b':' | b'!' | b'?' | b'*' | b'_' | b'~'
+                )
+            {
+                stripped -= 1;
+            }
+            self.stripped.push((raw, stripped));
+            tally(raw - stripped);
+        }
     }
-    if token.len() < 4 {
-        return None;
-    }
-    let lower = token.to_ascii_lowercase();
-    let end = at + token.len();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        return (token.len() > 8).then(|| (end, token.to_owned()));
-    }
-    if lower.starts_with("www.") {
-        return Some((end, format!("https://{token}")));
-    }
-    if lower.starts_with("mailto:") {
-        return Some((end, token.to_owned()));
-    }
-    if let Some((user, host)) = token.split_once('@')
-        && !user.is_empty()
-        && !user.contains('/')
-        && is_domain(host)
-    {
-        return Some((end, format!("mailto:{token}")));
-    }
-    let (host, _) = token.split_once('/').unwrap_or((token, ""));
-    if is_domain(host) {
-        return Some((end, format!("https://{token}")));
-    }
-    None
 }
 
 /// Whether a token is a hostname without a scheme.
@@ -809,50 +1037,6 @@ mod tests {
     }
 
     #[test]
-    fn the_last_closer_answers_what_a_search_ahead_did() {
-        // The search each opener used to run, to check the shortcut against.
-        fn closer_after(chars: &[char], from: usize, marker: char) -> bool {
-            (from..chars.len()).any(|j| chars[j] == marker && is_closer(chars, j))
-        }
-        let alphabet = ['*', '_', '~', 'a', ' ', '1', '.'];
-        let mut seed = 12_345_u32;
-        let mut next = || {
-            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            (seed >> 16) as usize
-        };
-        for _ in 0..3000 {
-            let len = next() % 14;
-            let line: Vec<char> = (0..len)
-                .map(|_| alphabet[next() % alphabet.len()])
-                .collect();
-            let last = last_closers(&line);
-            for (index, marker) in ['*', '_', '~'].into_iter().enumerate() {
-                for i in 0..line.len() {
-                    assert_eq!(
-                        last[index].is_some_and(|close| close > i),
-                        closer_after(&line, i + 1, marker),
-                        "{line:?} at {i}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_long_line_of_openers_that_never_close_parses_quickly() {
-        // 270,000 characters: searching ahead from each opener checked about
-        // 10^10 of them, so this took minutes; it now takes milliseconds.
-        let line = "*a _a ~a ".repeat(30_000);
-        let started = std::time::Instant::now();
-        assert_eq!(plain(&line, &[]), line);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
-        );
-    }
-
-    #[test]
     fn stray_markers_stay_literal() {
         assert_eq!(plain("2 * 3 = 6", &[]), "2 * 3 = 6");
         assert_eq!(plain("snake_case_name", &[]), "snake_case_name");
@@ -1039,6 +1223,337 @@ mod tests {
                 .all(|span| !span.mention)
         );
         assert_eq!(plain("ping @all", &everyone), "ping @all");
+    }
+
+    /// The links in `text`: where each starts and ends, and where it goes.
+    fn links_in(text: &str) -> Vec<(usize, usize, String)> {
+        let mut at = 0;
+        parse(text, &[])
+            .into_iter()
+            .filter_map(|span| {
+                let found = span.link.map(|target| (at, at + span.text.len(), target));
+                at += span.text.len();
+                found
+            })
+            .collect()
+    }
+
+    /// A mail address or a site at `at`, read from `at` alone.
+    fn address_at(text: &str, at: usize) -> Option<(usize, String)> {
+        let rest = &text[at..];
+        let (mut parens, mut squares) = (0usize, 0usize);
+        let token_end = rest
+            .find(|c: char| {
+                let depth = match c {
+                    '(' | ')' => &mut parens,
+                    '[' | ']' => &mut squares,
+                    _ => {
+                        return c.is_whitespace()
+                            || matches!(c, '<' | '>' | '"' | '\'' | '{' | '}');
+                    }
+                };
+                if matches!(c, '(' | '[') {
+                    *depth += 1;
+                    false
+                } else if *depth > 0 {
+                    *depth -= 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .unwrap_or(rest.len());
+        let mut token = &rest[..token_end];
+        while let Some(stripped) = token.strip_suffix(['.', ',', ';', ':', '!', '?', '*', '_', '~'])
+        {
+            token = stripped;
+        }
+        if token.len() < 4 {
+            return None;
+        }
+        let lower = token.to_ascii_lowercase();
+        let end = at + token.len();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return (token.len() > 8).then(|| (end, token.to_owned()));
+        }
+        if lower.starts_with("www.") {
+            return Some((end, format!("https://{token}")));
+        }
+        if lower.starts_with("mailto:") {
+            return Some((end, token.to_owned()));
+        }
+        if let Some((user, host)) = token.split_once('@')
+            && !user.is_empty()
+            && !user.contains('/')
+            && is_domain(host)
+        {
+            return Some((end, format!("mailto:{token}")));
+        }
+        let (host, _) = token.split_once('/').unwrap_or((token, ""));
+        is_domain(host).then(|| (end, format!("https://{token}")))
+    }
+
+    /// The links of a scan that reads the whole token from every candidate
+    /// it stops at, which is how `link_and_mention` read a span before
+    /// #1177.
+    fn links_read_from_every_candidate(text: &str) -> Vec<(usize, usize, String)> {
+        let bytes = text.as_bytes();
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i < text.len() {
+            if !text.is_char_boundary(i) {
+                i += 1;
+                continue;
+            }
+            let at_boundary = i == 0
+                || !text[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric());
+            if at_boundary {
+                if bytes[i].is_ascii_digit() || matches!(bytes[i], b'+' | b'(') {
+                    if let Some(end) = date_end(text, i) {
+                        i = end;
+                        continue;
+                    }
+                    let (end, digits, valid) = phone_at(text, i);
+                    // Without digits the scan had nothing to say about `i`.
+                    if !digits.is_empty() {
+                        if valid {
+                            found.push((i, end, format!("tel:{digits}")));
+                            i = end;
+                            continue;
+                        }
+                        if digits.len() > 15 && !text[end..].starts_with('@') {
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+                if bytes[i].is_ascii_alphanumeric()
+                    && let Some((end, url)) = address_at(text, i)
+                {
+                    found.push((i, end, url));
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        found
+    }
+
+    /// Text made of the characters the scanner decides by, from a seed, so
+    /// that a failure repeats.
+    fn decided_text(seed: u64, length: usize) -> String {
+        let marks = "ab1é.-@/:()[]<>\"{} ,;!?htpswmoc";
+        let marks: Vec<char> = marks.chars().collect();
+        let mut state = seed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        (0..length).map(|_| marks[next() % marks.len()]).collect()
+    }
+
+    /// #1177: the scanner reads a long token once, and finds what a scan
+    /// from every candidate found: the same links, in the same places.
+    #[test]
+    fn links_are_what_a_scan_from_every_candidate_finds() {
+        let mut texts: Vec<String> = [
+            "see https://a.b/c?d=1.",
+            "go to spotifast.rocks!",
+            "mail hello@section8berlin.com or dm",
+            "(www.rust-lang.org)",
+            "version 0.3.0 of main.rs and e.g. this",
+            "abchttp://x",
+            "https://example.com/testing(testing)",
+            "read https://en.wikipedia.org/wiki/Foo_(bar).",
+            "(see https://en.wikipedia.org/wiki/Foo_(bar))",
+            "(see https://example.com)",
+            "[https://example.com/a[1]]",
+            "example.com/a(b)c, then",
+            "CPF 000.000.000-00; call 000 0000-0000 or +00 (00) 00000-0000.",
+            "Call (212) 555-1212",
+            "Call +1 (212) 555-1212",
+            "Date 2026-10-01",
+            "Date (2026-10-01)",
+            "Date 2026-10-01 12:30",
+            "Date 2026-10-01 1234567",
+            "Reference 12345678-90123456",
+            "1234567@example.com",
+            "1234567890123456@example.com",
+            "id 000000; long id 0000000000000000",
+            "abc00000000000",
+            "HTTP://EXAMPLE.COM",
+            "Https://x.y",
+            "http://x",
+            "www.x",
+            "mailto:a@b.co",
+            "a.b:8080/x",
+            "a-.b.com",
+            "a.-b.com",
+            "a..b.com",
+            "-a.b.com",
+            "a_b.com",
+            "a(b.c)d",
+            "a[b.c]d",
+            "a(b.c",
+            "a((b.c))",
+            "a([b.c)]",
+            "see(https://x.com/a)",
+            "12345678901234567890@b.com",
+            "( ( 5551234x",
+            "((",
+            "a)b.com",
+            "x.com)",
+            "x.com.",
+            "x.com/.",
+            "a@b.com.",
+            "a@b.com/x",
+            "a/b.com",
+            "ab.cd)e.fg",
+            "ab.cd-.e)f",
+            "a(a(a(x)y)y)y)y)",
+            "a([a)]a)",
+            "aa.bb:cc.dd)e.fg",
+            "x_y@a.b",
+            "x.y@z@w.com",
+            "a@-b.com",
+            "a@.b.com",
+            "a@b.c:80",
+            "see.https://x.com",
+            "cp1-c.pb",
+            "a-b.com",
+            "x-y.z-w.com/p-q",
+            "a@b-c.com",
+            "a.b-c",
+            "ab-.cd.com",
+        ]
+        .iter()
+        .map(|text| (*text).to_owned())
+        .collect();
+        for unit in [
+            "a.a",
+            "a_a.",
+            "a@b.",
+            "( ",
+            "- ",
+            "a(a",
+            "a(a)",
+            "a.a)",
+            "a-",
+            "https://",
+            "a(.....",
+            "(a.b.c)",
+            "x@aa.bb(",
+            "12 34 ",
+            "( 5551234x ",
+            "a)b",
+            "a[",
+            "]{",
+            "a,.",
+            "mail:",
+            "wa.me/",
+            "a@b.c:80",
+            "ab.cd-.e)f",
+            "a([a)]",
+            "a.a.aaaa",
+            "12:34.56.78",
+            "((",
+            "))",
+            "+ + ",
+            "@1.",
+            "a@1.2.3.4",
+        ] {
+            texts.push(unit.repeat(40));
+        }
+        for seed in 1..=20_000 {
+            let text = decided_text(seed, seed as usize * 7 % 61);
+            // A line that starts with `- ` is a list item and one that
+            // starts with `> ` a quote: `parse` replaces either beginning
+            // with a sign of its own, which is not what this test is about.
+            if !text.starts_with("- ") && !text.starts_with("> ") {
+                texts.push(text);
+            }
+        }
+        for text in &texts {
+            assert_eq!(
+                links_in(text),
+                links_read_from_every_candidate(text),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// #1177: a long line is read a fixed number of times over, whatever it
+    /// is made of, not once per letter, bracket or marker in it.
+    #[test]
+    fn a_long_line_is_read_a_fixed_number_of_times() {
+        let mut lines: Vec<String> = [
+            "*a ",
+            "_a ~b ",
+            "a.",
+            "a_a.",
+            "a@b.",
+            "( ",
+            "- ",
+            "a(a",
+            "a(a)",
+            "a.a)",
+            "a-",
+            "https://",
+            "a`.",
+            "a(.....",
+            "a@b.c@d.e",
+            "(a.b.c)",
+            "x@aa.bb(",
+            "12 34 ",
+            "( 5551234x ",
+            "a)b",
+            "a[",
+            "]{",
+            "mail:",
+            "wa.me/",
+            "a@b.c:80",
+            "ab.cd-.e)f",
+            "a([a)]",
+            "a.a.aaaa",
+            "12:34.56.78",
+            "((",
+            "))",
+            "+ + ",
+            "```a",
+            "a`b`c`d`e`f`g`h`i`j`k`l`m`n`o`p`",
+            "2 * 3 = 6 * 7 = 42 * 11 = 121 * ",
+        ]
+        .iter()
+        .map(|unit| unit.repeat(2_000))
+        .collect();
+        lines.push(format!("{}x_y.zzz.{}", "a.".repeat(4_000), "com"));
+        lines.push(format!("({}.com)", "a.".repeat(6_000)));
+        lines.push(format!("{}zz.com", "@b.".repeat(6_000)));
+        lines.push(format!("({}.com)", "@b.".repeat(6_000)));
+        lines.push(format!("{}a-.com", "a.a".repeat(6_000)));
+        for seed in 1..=12 {
+            lines.push(decided_text(seed, 3_000));
+        }
+        for seed in 1..=4 {
+            lines.push(decided_text(seed, 9_000));
+        }
+        for line in &lines {
+            READS.with(|reads| reads.set(0));
+            parse(line, &[]);
+            let reads = READS.with(std::cell::Cell::get);
+            let characters = line.chars().count() as u64;
+            let head: String = line.chars().take(24).collect();
+            assert!(
+                reads <= 16 * characters,
+                "{reads} characters read in a line of {characters}: {head:?}"
+            );
+        }
     }
 }
 
